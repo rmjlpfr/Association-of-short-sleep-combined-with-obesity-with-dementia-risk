@@ -1,0 +1,151 @@
+# Sleep, obesity and dementia
+
+library(survival)
+library(mice)
+library(broom)
+library(lme4)
+library(lmerTest)
+
+dir.create("results")
+
+# Multiple imputation
+
+dat <- readRDS("data/survival.rds")
+
+fixed <- c("follow_up", "dementia", "sleep_obesity", "age", "sex", "ethnicity")
+binary <- c("education", "physical_inactivity", "smoking", "excess_alcohol",
+            "hypertension", "diabetes", "depression", "hearing_impairment",
+            "social_isolation")
+dat <- dat[c(fixed, binary, "high_ldl", "apoe4")]
+
+stopifnot(
+  nrow(dat) > 0,
+  all(complete.cases(dat[fixed])),
+  is.numeric(dat$follow_up), all(is.finite(dat$follow_up)),
+  all(dat$follow_up > 0),
+  is.numeric(dat$dementia), all(dat$dementia %in% 0:1),
+  is.numeric(dat$age), all(is.finite(dat$age)),
+  all(vapply(dat[c("sleep_obesity", "sex", "ethnicity", binary, "apoe4")],
+             function(x) is.factor(x) && !is.ordered(x), logical(1))),
+  all(vapply(dat[binary], nlevels, integer(1)) == 2L),
+  nlevels(dat$apoe4) == 3L,
+  is.numeric(dat$high_ldl),
+  all(na.omit(dat$high_ldl) %in% 0:1),
+  all(vapply(dat, function(x) length(unique(na.omit(x))) > 1L, logical(1)))
+)
+
+dat$sleep_obesity <- relevel(dat$sleep_obesity, ref = "1")
+stopifnot(setequal(levels(dat$sleep_obesity), as.character(1:4)))
+
+method <- make.method(dat)
+method[fixed] <- ""
+method[binary] <- "logreg"
+method["apoe4"] <- "polyreg"
+method["high_ldl"] <- "pmm"
+
+# Follow-up time and dementia status predict missing covariates.
+pred <- make.predictorMatrix(dat)
+pred[fixed, ] <- 0
+diag(pred) <- 0
+
+imp <- mice(dat, m = 20, maxit = 20, method = method,
+            predictorMatrix = pred, seed = 123, printFlag = FALSE)
+
+saveRDS(imp, "results/imputations.rds")
+pdf("results/imputation_trace.pdf")
+print(plot(imp))
+dev.off()
+print(imp$loggedEvents)
+
+# Sequentially adjusted Cox models
+
+dat <- imp$data
+
+model1 <- coxph(
+  Surv(follow_up, dementia) ~ sleep_obesity + age + sex + ethnicity,
+  data = dat, na.action = na.fail, x = TRUE
+)
+
+model2 <- with(imp, coxph(
+  Surv(follow_up, dementia) ~ sleep_obesity + age + sex + ethnicity +
+    education, na.action = na.fail
+))
+
+model3 <- with(imp, coxph(
+  Surv(follow_up, dementia) ~ sleep_obesity + age + sex + ethnicity +
+    education + physical_inactivity + hypertension + diabetes + high_ldl +
+    smoking + excess_alcohol + hearing_impairment, na.action = na.fail
+))
+
+model4 <- with(imp, coxph(
+  Surv(follow_up, dementia) ~ sleep_obesity + age + sex + ethnicity +
+    education + physical_inactivity + hypertension + diabetes + high_ldl +
+    smoking + excess_alcohol + hearing_impairment + depression +
+    social_isolation, na.action = na.fail
+))
+
+model5 <- with(imp, coxph(
+  Surv(follow_up, dementia) ~ sleep_obesity + age + sex + ethnicity +
+    education + physical_inactivity + hypertension + diabetes + high_ldl +
+    smoking + excess_alcohol + hearing_impairment + depression +
+    social_isolation + apoe4, na.action = na.fail
+))
+
+results1 <- tidy(model1, conf.int = TRUE, exponentiate = TRUE)
+write.csv(results1, "results/cox_model1.csv", row.names = FALSE)
+
+# Pool log hazard ratios and their variances, then exponentiate.
+models <- list(model2, model3, model4, model5)
+for (i in seq_along(models)) {
+  pooled <- pool(models[[i]])
+  results <- summary(pooled, conf.int = TRUE, exponentiate = TRUE)
+  write.csv(results, paste0("results/cox_model", i + 1L, ".csv"),
+            row.names = FALSE)
+}
+
+print(cox.zph(model1))
+# These are separate diagnostics for each imputation, not pooled tests.
+ph_model5 <- lapply(model5$analyses, cox.zph)
+saveRDS(ph_model5, "results/ph_model5.rds")
+
+# Linear mixed-effects model
+
+dat <- readRDS("data/cognition_long.rds")
+dat <- dat[c("id", "cognition_z", "time_z", "age_z", "sleep_obesity",
+             "sex", "ethnicity")]
+
+stopifnot(
+  nrow(dat) > 0, all(complete.cases(dat)),
+  all(vapply(dat[c("cognition_z", "time_z", "age_z")],
+             function(x) is.numeric(x) && all(is.finite(x)), logical(1))),
+  all(vapply(dat[c("sleep_obesity", "sex", "ethnicity")],
+             function(x) is.factor(x) && !is.ordered(x), logical(1))),
+  all(table(dat$id) >= 2),
+  !anyDuplicated(dat[c("id", "time_z")])
+)
+dat$sleep_obesity <- relevel(dat$sleep_obesity, ref = "1")
+stopifnot(setequal(levels(dat$sleep_obesity), as.character(1:4)))
+
+model <- lmer(
+  cognition_z ~ sleep_obesity * time_z + age_z + sex + ethnicity +
+    (time_z | id),
+  data = dat, REML = TRUE, na.action = na.fail,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+print(summary(model))
+print(isSingular(model))
+
+est <- coef(summary(model))
+results <- data.frame(
+  term = rownames(est),
+  estimate = est[, "Estimate"],
+  std.error = est[, "Std. Error"],
+  conf.low = est[, "Estimate"] - qnorm(0.975) * est[, "Std. Error"],
+  conf.high = est[, "Estimate"] + qnorm(0.975) * est[, "Std. Error"],
+  p.value = est[, "Pr(>|t|)"],
+  row.names = NULL
+)
+
+write.csv(results, "results/linear_mixed_model.csv", row.names = FALSE)
+
